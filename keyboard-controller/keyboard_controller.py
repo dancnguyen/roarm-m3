@@ -3,12 +3,16 @@
 
 Two control modes (Tab switches between them):
 - Joint mode: each key pair drives one joint with {"T":101} (radians).
-- Axis mode: each key pair moves the gripper tip along one axis with
-  {"T":103}: X, Y, Z (mm), pitch, roll and gripper (radians).
+- Axis mode: each key pair moves the gripper tip along one axis (X, Y, Z,
+  pitch, roll, gripper) with {"T":123,"m":1}: the arm keeps moving the axis
+  until it is told to stop.
 
-- Tap a key: the joint/axis moves one small step.
-- Hold a key: after a short delay it moves continuously, speeding up
-  the longer the key is held (up to a maximum speed).
+- Joint mode: a tap moves the joint one small step. Holding the key moves it
+  continuously, speeding up the longer the key is held (up to a maximum speed).
+- Axis mode: the axis moves at a fixed speed while the key is held and stops
+  when it is released. A tap gives a short pulse of motion.
+- Each control's bar is also a slider: click or drag it with the mouse to
+  send that joint or axis to the value under the mouse.
 - Movements can be recorded to a JSON file and played back once, a number of
   times, or forever.
 
@@ -52,24 +56,15 @@ except Exception:  # not installed, or no zenity/kdialog on Linux
 # ---------------------------------------------------------------------------
 # Tuning
 # ---------------------------------------------------------------------------
-# Angles (joints, and pitch/roll/gripper in axis mode)
+# Joint mode
 TAP_STEP = math.radians(2.0)     # rad moved by a quick tap
 HOLD_DELAY = 0.25                # s before a held key starts continuous motion
 START_SPEED = math.radians(10)   # rad/s when continuous motion begins
 ACCELERATION = math.radians(40)  # rad/s^2 added while the key stays held
 MAX_SPEED = math.radians(90)     # rad/s cap
 
-# Distances (X, Y, Z in axis mode)
-LINEAR_TAP_STEP = 5.0            # mm moved by a quick tap
-LINEAR_START_SPEED = 20.0        # mm/s when continuous motion begins
-LINEAR_ACCELERATION = 60.0       # mm/s^2 added while the key stays held
-LINEAR_MAX_SPEED = 100.0         # mm/s cap
-
 LOOP_HZ = 50                     # control loop rate
 SEND_HZ = 25                     # max T:101 commands per second per joint
-# T:103 makes the arm finish each move before it reads the next command, so
-# axis mode sends fewer, larger steps while a key is held.
-AXIS_SEND_HZ = 5                 # max T:103 commands per second per axis
 
 # Passed through to T:101. spd = steps/s (0 = max), acc = 100 steps/s^2 (0 = max).
 # Targets are updated in small increments, so letting the servo run at max
@@ -77,8 +72,22 @@ AXIS_SEND_HZ = 5                 # max T:103 commands per second per axis
 CMD_SPD = 0
 CMD_ACC = 0
 
-# Passed through to T:103. Larger is faster; 0.25 is the value in Waveshare's example.
-AXIS_CMD_SPD = 0.25
+# Axis mode (T:123 continuous movement)
+# Speed coefficient passed to T:123. Larger is faster; the docs suggest 0-20.
+AXIS_CMD_SPD = 5
+AXIS_TAP_TIME = 0.1              # s an axis moves for a quick tap
+AXIS_POLL_HZ = 10                # position reads (T:105) per second while an axis moves
+AXIS_POLL_AFTER_STOP = 0.1       # s to wait after a stop before reading the final position
+
+# Mouse sliders
+# A joint moved with its slider glides to the slider value at up to MAX_SPEED.
+# An axis moved with its slider runs (T:123) until the position read back is
+# within this distance of the slider value, or has passed it.
+SLIDER_TOLERANCE_MM = 2.0                # X/Y/Z
+SLIDER_TOLERANCE_RAD = math.radians(1)   # pitch, roll, gripper
+# Stop a slider-driven axis if no position has been read back for this long,
+# since the controller can't tell when it reaches the slider value.
+SLIDER_FEEDBACK_TIMEOUT = 0.5            # s
 
 # T:114 LED brightness values for on and off.
 LED_ON = 255
@@ -96,9 +105,9 @@ RECORDING_VERSION = 1
 
 @dataclass(eq=False)
 class Control:
-    """One key pair: a joint (T:101) or an axis of the gripper tip (T:103)."""
+    """One key pair: a joint (T:101) or an axis of the gripper tip (T:123)."""
     mode: str          # "joint" or "axis"
-    number: int        # joint id for T:101, axis id for T:103
+    number: int        # joint id for T:101, axis id for T:123
     name: str
     minimum: float     # rad, or mm for linear axes
     maximum: float
@@ -113,9 +122,21 @@ class Control:
         return "mm" if self.linear else "rad"
 
     def command(self, value):
-        if self.mode == "joint":
-            return {"T": 101, "joint": self.number, "rad": round(value, 4), "spd": CMD_SPD, "acc": CMD_ACC}
-        return {"T": 103, "axis": self.number, "pos": round(value, 2 if self.linear else 4), "spd": AXIS_CMD_SPD}
+        """T:101 command that moves a joint to value (rad)."""
+        return {"T": 101, "joint": self.number, "rad": round(value, 4), "spd": CMD_SPD, "acc": CMD_ACC}
+
+    def axis_command(self, direction, spd=AXIS_CMD_SPD):
+        """T:123 command that starts moving an axis (+1 or -1) or stops it (0)."""
+        return {"T": 123, "m": 1, "axis": self.number, "cmd": AXIS_CMD_OF[direction], "spd": spd}
+
+
+# T:123 "cmd" values: 1 = increase, 2 = decrease, 0 = stop.
+AXIS_CMD_OF = {+1: 1, -1: 2, 0: 0}
+AXIS_DIRECTION_OF = {v: k for k, v in AXIS_CMD_OF.items()}
+
+
+def is_axis_stop(cmd):
+    return cmd.get("T") == 123 and cmd.get("cmd") == 0
 
 
 # Joint ranges and home positions are from the Waveshare RoArm-M3 JSON command docs.
@@ -128,11 +149,12 @@ JOINTS = [
     Control("joint", 6, "Gripper",   1.08,  3.14, math.pi,     pygame.K_h, pygame.K_y, "g"),
 ]
 
-# Axes for T:103, using the same keys as the joints. X points straight ahead of
-# the arm, Y to its left and Z up. The docs give no X/Y/Z limits, so these are
-# cautious guesses: widen them once you know your arm's workspace. The X/Y/Z
-# home values come from the feedback example in the docs and are only used
-# when the arm can't report its position (e.g. --dry-run).
+# Axes for T:123 (m=1), using the same keys as the joints. X points straight
+# ahead of the arm, Y to its left and Z up. The docs give no X/Y/Z limits, so
+# these are cautious guesses: widen them once you know your arm's workspace.
+# The controller stops an axis when the position it reads back reaches a limit.
+# The X/Y/Z home values come from the feedback example in the docs and are only
+# used when the arm can't report its position (e.g. --dry-run).
 AXES = [
     Control("axis", 1, "X",        100.0, 450.0, 345.0,   pygame.K_a, pygame.K_q, "x", linear=True),
     Control("axis", 2, "Y",       -350.0, 350.0,   0.0,   pygame.K_s, pygame.K_w, "y", linear=True),
@@ -145,7 +167,7 @@ AXES = [
 CONTROLS = {"joint": JOINTS, "axis": AXES}
 JOINTS_BY_NUMBER = {c.number: c for c in JOINTS}
 AXES_BY_NUMBER = {c.number: c for c in AXES}
-MODE_LABEL = {"joint": "Joint mode (T:101)", "axis": "Axis mode (T:103)"}
+MODE_LABEL = {"joint": "Joint mode (T:101)", "axis": "Axis mode (T:123)"}
 
 
 def clamp(control, value):
@@ -174,9 +196,11 @@ QUIT_KEY = pygame.K_ESCAPE                      # when not playing
 # ---------------------------------------------------------------------------
 # Links to the arm
 # ---------------------------------------------------------------------------
-# Every link has the same interface: send(cmd), request_feedback(),
-# cancel_pending(), close(), an `error` attribute holding the last
-# communication error (or None), and `simulated` (True only for --dry-run).
+# Every link has the same interface: send(cmd), request_feedback() (waits for
+# the answer), poll_feedback() + take_feedback() (ask now, collect the answer
+# later without waiting), cancel_pending(), close(), an `error` attribute
+# holding the last communication error (or None), and `simulated` (True only
+# for --dry-run).
 
 
 def _encode(cmd: dict) -> str:
@@ -207,6 +231,12 @@ class DryRunLink:
     def request_feedback(self, timeout=1.0):
         return None
 
+    def poll_feedback(self):
+        pass
+
+    def take_feedback(self):
+        return None
+
     def cancel_pending(self):
         pass
 
@@ -214,7 +244,30 @@ class DryRunLink:
         pass
 
 
-class SerialLink:
+class _FeedbackStore:
+    """Keeps the latest T:1051 feedback message for take_feedback()."""
+
+    def _init_feedback(self):
+        self.feedback = None          # latest T:1051 message (dict)
+        self.feedback_event = threading.Event()
+        self._feedback_seq = 0        # counts messages received
+        self._taken_seq = 0
+
+    def _store_feedback(self, msg):
+        self.feedback = msg
+        self._feedback_seq += 1
+        self.feedback_event.set()
+
+    def take_feedback(self):
+        """Return feedback received since the last call, or None."""
+        seq = self._feedback_seq
+        if seq == self._taken_seq:
+            return None
+        self._taken_seq = seq
+        return self.feedback
+
+
+class SerialLink(_FeedbackStore):
     """Sends JSON commands over USB serial and reads feedback in a background thread."""
 
     simulated = False
@@ -223,8 +276,7 @@ class SerialLink:
         if serial is None:
             sys.exit("pyserial is not installed. Run: pip install -r requirements.txt")
         self.error = None
-        self.feedback = None          # latest T:1051 message (dict)
-        self.feedback_event = threading.Event()
+        self._init_feedback()
         self._lock = threading.Lock()
         self._running = True
         self._ser = serial.Serial(port, baud, timeout=0.1, dsrdtr=None)
@@ -248,8 +300,7 @@ class SerialLink:
                 continue
             msg = _parse_feedback(raw.decode(errors="ignore"))
             if msg is not None:
-                self.feedback = msg
-                self.feedback_event.set()
+                self._store_feedback(msg)
 
     def request_feedback(self, timeout=1.0):
         """Ask the arm for its joint angles. Returns the dict or None."""
@@ -259,6 +310,10 @@ class SerialLink:
             return self.feedback
         return None
 
+    def poll_feedback(self):
+        """Ask for feedback without waiting; the answer arrives via take_feedback()."""
+        self.send({"T": 105})
+
     def cancel_pending(self):
         pass  # serial writes are sent immediately
 
@@ -267,17 +322,19 @@ class SerialLink:
         self._ser.close()
 
 
-class HttpLink:
+class HttpLink(_FeedbackStore):
     """Sends JSON commands as HTTP GET requests to http://<host>/js?json=<cmd>.
 
     Requests run in a background thread so a slow network never freezes the
     window. If commands are queued faster than the arm answers, an unsent
     command is replaced by a newer one of the same kind (the same joint for
-    T:101, the same axis for T:103), so the arm always gets the latest target
-    instead of a backlog.
+    T:101, the same axis for T:123), so the arm always gets the latest target
+    instead of a backlog. T:123 stop commands go to the front of the queue and
+    are retried if a request fails, because the arm keeps moving until it gets one.
     """
 
     simulated = False
+    STOP_ATTEMPTS = 3
 
     def __init__(self, host, timeout=HTTP_TIMEOUT):
         if requests is None:
@@ -285,6 +342,7 @@ class HttpLink:
         self.url = f"http://{host}/js"
         self.timeout = timeout
         self.error = None
+        self._init_feedback()
         self._session = requests.Session()  # reuses the connection between requests
         self._session_lock = threading.Lock()
         self._pending = {}                  # key -> cmd, oldest first
@@ -296,9 +354,13 @@ class HttpLink:
     def send(self, cmd: dict):
         key = (cmd.get("T"), cmd.get("joint", cmd.get("axis")))
         with self._cond:
-            # Remove and re-add so the newest command goes to the back of the queue.
+            # Remove and re-add so the newest command goes to the back of the
+            # queue, or to the front if it stops an axis.
             self._pending.pop(key, None)
-            self._pending[key] = cmd
+            if is_axis_stop(cmd):
+                self._pending = {key: cmd, **self._pending}
+            else:
+                self._pending[key] = cmd
             self._cond.notify()
 
     def _get(self, cmd, timeout):
@@ -312,15 +374,22 @@ class HttpLink:
             with self._cond:
                 while self._running and not self._pending:
                     self._cond.wait()
-                if not self._running:
-                    return
+                if not self._pending:
+                    return  # closed, and everything queued has been sent
                 key = next(iter(self._pending))
                 cmd = self._pending.pop(key)
-            try:
-                self._get(cmd, self.timeout)
+            for _ in range(self.STOP_ATTEMPTS if is_axis_stop(cmd) else 1):
+                try:
+                    body = self._get(cmd, self.timeout)
+                except requests.RequestException as e:
+                    self.error = f"HTTP request failed ({type(e).__name__})."
+                    continue
                 self.error = None
-            except requests.RequestException as e:
-                self.error = f"HTTP request failed ({type(e).__name__})."
+                if cmd["T"] == 105:
+                    msg = _parse_feedback(body)
+                    if msg is not None:
+                        self._store_feedback(msg)
+                break
 
     def request_feedback(self, timeout=1.0):
         """Ask the arm for its joint angles. Returns the dict or None."""
@@ -330,7 +399,14 @@ class HttpLink:
             self.error = f"HTTP request failed ({type(e).__name__})."
             return None
         self.error = None
-        return _parse_feedback(body)
+        msg = _parse_feedback(body)
+        if msg is not None:
+            self._store_feedback(msg)
+        return msg
+
+    def poll_feedback(self):
+        """Ask for feedback without waiting; the answer arrives via take_feedback()."""
+        self.send({"T": 105})
 
     def cancel_pending(self):
         """Drop commands that haven't been sent yet."""
@@ -338,10 +414,12 @@ class HttpLink:
             self._pending.clear()
 
     def close(self):
+        """Send what is still queued (e.g. a final stop), then shut down."""
         with self._cond:
             self._running = False
+            self._pending.pop((105, None), None)  # no one will read the answer
             self._cond.notify()
-        self._worker.join(timeout=self.timeout + 0.5)
+        self._worker.join(timeout=self.STOP_ATTEMPTS * self.timeout + 0.5)
         self._session.close()
 
 
@@ -369,11 +447,19 @@ def _check_command(cmd):
         out = c.command(clamp(c, float(cmd["rad"])))  # never leave the joint range
         out["spd"], out["acc"] = int(cmd.get("spd", CMD_SPD)), int(cmd.get("acc", CMD_ACC))
         return out
-    if kind == 103:
+    if kind == 123:
+        if int(cmd.get("m", 1)) != 1:
+            raise ValueError("only T:123 commands with m=1 (coordinate control) are supported")
         c = AXES_BY_NUMBER[int(cmd["axis"])]
-        out = c.command(clamp(c, float(cmd["pos"])))  # never leave the axis range
-        out["spd"] = float(cmd.get("spd", AXIS_CMD_SPD))
-        return out
+        direction = AXIS_DIRECTION_OF[int(cmd["cmd"])]
+        spd = max(0.0, float(cmd.get("spd", AXIS_CMD_SPD)))
+        return c.axis_command(direction, int(spd) if spd.is_integer() else spd)
+    if kind == 103:
+        # Older recordings used T:103 position commands; they still play.
+        c = AXES_BY_NUMBER[int(cmd["axis"])]
+        pos = clamp(c, float(cmd["pos"]))  # never leave the axis range
+        return {"T": 103, "axis": c.number, "pos": round(pos, 2 if c.linear else 4),
+                "spd": float(cmd.get("spd", 0.25))}
     if kind == 100:
         return {"T": 100}
     if kind == 114:
@@ -463,6 +549,17 @@ class KeyboardController:
         # Modes whose targets no longer match the arm, because the other mode
         # moved it. They are re-read from the arm before they are used.
         self.stale = set() if link.simulated else {"axis"}
+        # Axis mode (T:123): the direction each axis was last told to move
+        # (0 = stopped), and when a tap's short pulse of motion should stop.
+        self.axis_dir = {a: 0 for a in AXES}
+        self.axis_stop_at = {}
+        self.next_poll = 0.0             # earliest time for the next position read
+        self.poll_after_stop = False     # read the final position once axes stop
+        # Mouse sliders: the value each slider-driven control is heading for,
+        # and the control whose slider is being dragged (or None).
+        self.slider_goal = {}
+        self.dragging = None
+        self.last_feedback = 0.0         # when a position was last read back
         self.led_on = False  # the arm can't report its LED state; main() turns it off at startup
         self.status = ""
         self.recording = None  # dict while recording
@@ -479,7 +576,7 @@ class KeyboardController:
         if not self.link.simulated:
             if cmd["T"] in (100, 101):
                 self.stale.add("axis")
-            elif cmd["T"] == 103:
+            elif cmd["T"] in (103, 123):
                 self.stale.add("joint")
         if self.recording is not None:
             t = round(time.monotonic() - self.recording["t0"], 3)
@@ -529,6 +626,9 @@ class KeyboardController:
 
     def go_home(self):
         self.pressed_at.clear()
+        self.slider_goal.clear()
+        self.dragging = None
+        self.stop_all_axes(time.monotonic())
         self._send({"T": 100})
         for c in JOINTS + AXES:
             self.target[c] = self.last_sent[c] = c.home
@@ -590,27 +690,192 @@ class KeyboardController:
             return
         control, direction = entry
         self.pressed_at[key] = (now, control, direction)
+        # A key takes over from the mouse slider for this control.
+        self.slider_goal.pop(control, None)
+        if self.dragging is control:
+            self.dragging = None
+        if control.mode == "axis":
+            # T:123 keeps the axis moving until it is told to stop.
+            self.axis_stop_at.pop(control, None)
+            self._set_axis(control, direction, now)
+            return
         # Every press gives one small step right away, so a tap always moves.
-        step = LINEAR_TAP_STEP if control.linear else TAP_STEP
-        self._move(control, direction * step)
+        self._move(control, direction * TAP_STEP)
         self._send_control(control, now, force=True)
 
     def key_up(self, key, now):
-        if key in self.pressed_at:
-            _, control, _ = self.pressed_at.pop(key)
+        if key not in self.pressed_at:
+            return
+        t0, control, _ = self.pressed_at.pop(key)
+        if control.mode == "joint":
             # Send the final position so it stops exactly at the target.
             self._send_control(control, now, force=True)
+            return
+        held = self._held_direction(control)
+        if held:
+            # The opposite key for this axis is still down: move that way instead.
+            self._set_axis(control, held, now)
+        elif self.axis_dir[control]:
+            # A quick tap still moves for AXIS_TAP_TIME.
+            stop_at = t0 + AXIS_TAP_TIME
+            if now >= stop_at:
+                self._set_axis(control, 0, now)
+            else:
+                self.axis_stop_at[control] = stop_at
 
     def release_all_keys(self, now):
-        for key in list(self.pressed_at):
-            self.key_up(key, now)
+        """Let go of every key and slider and stop all motion right away."""
+        stopping = [c for _, c, _ in self.pressed_at.values()] + list(self.slider_goal)
+        self.pressed_at.clear()
+        self.slider_goal.clear()
+        self.dragging = None
+        for control in stopping:
+            if control.mode == "joint":
+                self._send_control(control, now, force=True)
+        self.stop_all_axes(now)
+
+    # -- mouse sliders ----------------------------------------------------
+    def slider_press(self, control, value, now):
+        """The mouse button went down on a control's slider at value."""
+        if self.dialog or self.prompt or self.playback or control.mode != self.mode:
+            return
+        if any(c is control for _, c, _ in self.pressed_at.values()):
+            return  # a key is already moving this control
+        if not self.ensure_synced(self.mode):
+            self.status = NO_FEEDBACK
+            return
+        self.dragging = control
+        self._set_slider_goal(control, value, now)
+
+    def slider_drag(self, value, now):
+        """The mouse moved while dragging a slider."""
+        if self.dragging is not None:
+            self._set_slider_goal(self.dragging, value, now)
+
+    def slider_release(self, now):
+        """The mouse button came up. The control keeps going to the slider value."""
+        self.dragging = None
+
+    def _set_slider_goal(self, control, value, now):
+        self.slider_goal[control] = clamp(control, value)
+        if control.mode == "axis":
+            self._steer_axis(control, now)
+
+    @staticmethod
+    def _slider_tolerance(control):
+        return SLIDER_TOLERANCE_MM if control.linear else SLIDER_TOLERANCE_RAD
+
+    def _steer_axis(self, control, now, from_feedback=False):
+        """Run a slider-driven axis toward its goal, or stop it once it is there.
+
+        from_feedback: called because a new position was read. If the axis has
+        passed the goal it stops instead of turning back, so it can't oscillate.
+        When the user moves the slider behind the axis, it does turn back."""
+        goal = self.slider_goal.get(control)
+        if goal is None:
+            return
+        diff = goal - self.target[control]
+        direction = self.axis_dir[control]
+        passed = from_feedback and direction and diff * direction < 0
+        if abs(diff) <= self._slider_tolerance(control) or passed:
+            self._set_axis(control, 0, now)
+            return
+        if not any(self.axis_dir.values()):
+            self.last_feedback = now  # start the no-feedback timer now
+        self._set_axis(control, 1 if diff > 0 else -1, now)
+
+    def _update_joint_sliders(self, now, dt):
+        """Glide slider-driven joints toward their goals at up to MAX_SPEED."""
+        step = MAX_SPEED * dt
+        for c, goal in list(self.slider_goal.items()):
+            if c.mode != "joint":
+                continue
+            cur = self.target[c]
+            if abs(goal - cur) <= step:
+                self.target[c] = goal
+                self._send_control(c, now, force=True)
+                if c is not self.dragging:
+                    del self.slider_goal[c]
+            else:
+                self.target[c] = cur + math.copysign(step, goal - cur)
 
     def _move(self, control, delta):
         self.target[control] = step_within_range(control, self.target[control], delta)
 
+    # -- axis mode (T:123) --------------------------------------------------
+    def _held_direction(self, control):
+        """Direction of the most recently pressed key still held for control, or 0."""
+        held = [(t0, d) for t0, c, d in self.pressed_at.values() if c is control]
+        return max(held)[1] if held else 0
+
+    @staticmethod
+    def _at_limit(control, value, direction):
+        return value >= control.maximum if direction > 0 else value <= control.minimum
+
+    def _set_axis(self, control, direction, now, spd=AXIS_CMD_SPD):
+        """Start moving an axis (+1 / -1) or stop it (0) with T:123."""
+        if direction and self._at_limit(control, self.target[control], direction):
+            self.status = f"{control.name} is at the end of its range."
+            direction = 0
+        if direction == 0:
+            self.slider_goal.pop(control, None)
+        if direction == self.axis_dir[control]:
+            return
+        self._send(control.axis_command(direction, spd))
+        self.axis_dir[control] = direction
+        if direction == 0:
+            self.axis_stop_at.pop(control, None)
+            # Read the final position once the arm has had a moment to stop.
+            self.poll_after_stop = True
+            self.next_poll = max(self.next_poll, now + AXIS_POLL_AFTER_STOP)
+
+    def stop_all_axes(self, now):
+        self.axis_stop_at.clear()
+        for a in AXES:
+            if self.axis_dir[a]:
+                self._set_axis(a, 0, now)
+
+    def _update_axes(self, now):
+        """End tap pulses, read positions while axes move and stop them at their limits."""
+        for a, stop_at in list(self.axis_stop_at.items()):
+            if now >= stop_at:
+                self._set_axis(a, 0, now)
+        fb = self.link.take_feedback()
+        if fb is not None:
+            self.last_feedback = now
+            for a in AXES:
+                if a.feedback_key in fb:
+                    self.target[a] = float(fb[a.feedback_key])
+                if self.axis_dir[a] and self._at_limit(a, self.target[a], self.axis_dir[a]):
+                    self._set_axis(a, 0, now)
+                    self.status = f"Stopped {a.name}: it reached the end of its range."
+                elif a in self.slider_goal:
+                    self._steer_axis(a, now, from_feedback=True)
+        axis_goals = [a for a in self.slider_goal if a.mode == "axis"]
+        if axis_goals and self.link.simulated:
+            # --dry-run: no positions come back, so jump to the goal once the mouse is released.
+            for a in axis_goals:
+                if a is not self.dragging:
+                    self.target[a] = self.slider_goal[a]
+                    self._set_axis(a, 0, now)
+        elif any(self.axis_dir[a] for a in axis_goals) and now - self.last_feedback > SLIDER_FEEDBACK_TIMEOUT:
+            for a in axis_goals:
+                self._set_axis(a, 0, now)
+            self.status = "Stopped the slider move: no position feedback from the arm."
+        moving = any(self.axis_dir.values())
+        if (moving or self.poll_after_stop) and now >= self.next_poll:
+            self.link.poll_feedback()
+            self.next_poll = now + 1.0 / AXIS_POLL_HZ
+            if not moving:
+                self.poll_after_stop = False
+
     # -- recording --------------------------------------------------------
     def toggle_recording(self, now):
         if self.recording is None:
+            if any(self.axis_dir.values()):
+                # A recording must not begin with an axis already moving, or it
+                # would play back without the command that started it.
+                self.release_all_keys(now)
             # The start position is stored as joint angles, so they must be current.
             if not self.ensure_synced("joint"):
                 self.status = f"Can't start recording. {NO_FEEDBACK}"
@@ -708,6 +973,7 @@ class KeyboardController:
         """Interrupt playback and stop the arm where it is."""
         self.playback = None
         self.link.cancel_pending()
+        self.stop_all_axes(time.monotonic())
         self.hold_position()
         self.status = "Playback stopped."
 
@@ -717,7 +983,7 @@ class KeyboardController:
         if pb.phase == "to_start":
             if not pb.synced:
                 # The glide starts from the current joint angles, so they must be
-                # re-read if axis commands (T:103) moved the arm.
+                # re-read if axis commands (T:123) moved the arm.
                 if not self.ensure_synced("joint"):
                     self.playback = None
                     self.status = f"Playback stopped. {NO_FEEDBACK}"
@@ -748,6 +1014,8 @@ class KeyboardController:
                 self._play_command(commands[pb.index]["cmd"], now)
                 pb.index += 1
             if pb.index >= len(commands) and elapsed >= rec["duration"]:
+                # In case the recording left an axis moving (e.g. an edited file).
+                self.stop_all_axes(now)
                 if pb.loops and pb.loop >= pb.loops:
                     self.playback = None
                     self.status = f"Finished playing {pb.name}."
@@ -763,6 +1031,9 @@ class KeyboardController:
             self.target[c] = self.last_sent[c] = value
             self.last_send_time[c] = now
             self._send(cmd)
+        elif kind == 123:
+            # Goes through _set_axis so the range limits still apply.
+            self._set_axis(AXES_BY_NUMBER[cmd["axis"]], AXIS_DIRECTION_OF[cmd["cmd"]], now, cmd["spd"])
         elif kind == 100:
             self.go_home()
         elif kind == 114:
@@ -773,39 +1044,39 @@ class KeyboardController:
         if self.dialog and self.dialog.done.is_set():
             task, self.dialog = self.dialog, None
             task.on_done(task.result, task.error)
+        self._update_axes(now)
         if self.playback:
             self._update_playback(now, dt)
             return
+        self._update_joint_sliders(now, dt)
         for t0, control, direction in self.pressed_at.values():
-            speed = self.hold_speed(control, now - t0)
-            self._move(control, direction * speed * dt)
-        for c in self.controls:
+            if control.mode == "joint":
+                speed = self.hold_speed(now - t0)
+                self._move(control, direction * speed * dt)
+        for c in JOINTS:
             self._send_control(c, now)
 
     @staticmethod
-    def hold_speed(control, held):
-        """Speed (rad/s or mm/s) after a key has been held for `held` seconds."""
+    def hold_speed(held):
+        """Joint speed (rad/s) after a key has been held for `held` seconds."""
         if held < HOLD_DELAY:
             return 0.0
-        held -= HOLD_DELAY
-        if control.linear:
-            return min(LINEAR_MAX_SPEED, LINEAR_START_SPEED + LINEAR_ACCELERATION * held)
-        return min(MAX_SPEED, START_SPEED + ACCELERATION * held)
+        return min(MAX_SPEED, START_SPEED + ACCELERATION * (held - HOLD_DELAY))
 
     def _send_control(self, control, now, force=False):
+        """Send a joint's target with T:101 if it changed (at most SEND_HZ per second)."""
         value = self.target[control]
         if abs(value - self.last_sent[control]) < 1e-4:
             return
-        hz = SEND_HZ if control.mode == "joint" else AXIS_SEND_HZ
-        if not force and now - self.last_send_time[control] < 1.0 / hz:
+        if not force and now - self.last_send_time[control] < 1.0 / SEND_HZ:
             return
         self._send(control.command(value))
         self.last_sent[control] = value
         self.last_send_time[control] = now
 
-    def control_speed(self, control, now):
-        """Current commanded speed of a control (for display)."""
-        return sum(direction * self.hold_speed(c, now - t0)
+    def joint_speed(self, control, now):
+        """Current commanded speed of a joint in rad/s (for display)."""
+        return sum(direction * self.hold_speed(now - t0)
                    for t0, c, direction in self.pressed_at.values() if c is control)
 
     def status_lines(self, now):
@@ -849,6 +1120,38 @@ COLOR_REC = (255, 90, 90)
 COLOR_ERROR = (255, 110, 110)
 COLOR_MODE = {"joint": (200, 220, 255), "axis": (255, 205, 150)}
 COLOR_BAR = {"joint": (90, 170, 255), "axis": (255, 160, 70)}
+COLOR_GOAL = (235, 235, 235)
+
+# Layout of the control rows. Each row is ROW_H tall: a line of text, then
+# the slider bar. The mouse grabs a slider anywhere in SLIDER_HIT_TOP..BOTTOM.
+ROWS_TOP = 74
+ROW_H = 48
+BAR_X, BAR_W = 16, 560
+BAR_Y = 26                          # bar offset from the top of its row
+SLIDER_HIT_TOP, SLIDER_HIT_BOTTOM = 18, 42
+SLIDER_HIT_MARGIN = 8               # extra px left/right of the bar
+
+
+def slider_x(control, value):
+    frac = min(1.0, max(0.0, (value - control.minimum) / (control.maximum - control.minimum)))
+    return BAR_X + int(frac * BAR_W)
+
+
+def slider_value(control, x):
+    """Value of control at window x position x (clamped to its range)."""
+    frac = min(1.0, max(0.0, (x - BAR_X) / BAR_W))
+    return control.minimum + frac * (control.maximum - control.minimum)
+
+
+def slider_at(controls, pos):
+    """(control, value) for a mouse position on a slider, or None."""
+    x, y = pos
+    if not BAR_X - SLIDER_HIT_MARGIN <= x <= BAR_X + BAR_W + SLIDER_HIT_MARGIN:
+        return None
+    row, offset = divmod(y - ROWS_TOP, ROW_H)
+    if 0 <= row < len(controls) and SLIDER_HIT_TOP <= offset <= SLIDER_HIT_BOTTOM:
+        return controls[row], slider_value(controls[row], x)
+    return None
 
 
 def draw(screen, font, small, ctrl, now, port_label):
@@ -859,29 +1162,34 @@ def draw(screen, font, small, ctrl, now, port_label):
     other = "axis" if ctrl.mode == "joint" else "joint"
     screen.blit(small.render(f"{MODE_LABEL[ctrl.mode]}   Tab = switch to {other} mode",
                              True, COLOR_MODE[ctrl.mode]), (16, y))
-    y += 30
+    y = ROWS_TOP
     for c in ctrl.controls:
         value = ctrl.target[c]
         minus = pygame.key.name(c.key_minus).upper()
         plus = pygame.key.name(c.key_plus).upper()
-        speed = ctrl.control_speed(c, now)
         if c.linear:
             text = f"{c.number} {c.name:<9} {minus}/{plus}  {value:+7.1f} mm"
-            if speed:
-                text += f"   {speed:+.0f} mm/s"
         else:
             text = f"{c.number} {c.name:<9} {minus}/{plus}  {value:+.3f} rad  {math.degrees(value):+7.1f} deg"
+        if c.mode == "joint":
+            speed = ctrl.joint_speed(c, now)
             if speed:
                 text += f"   {math.degrees(speed):+.0f} deg/s"
+        elif ctrl.axis_dir[c]:
+            text += "   moving " + ("+" if ctrl.axis_dir[c] > 0 else "-")
         screen.blit(font.render(text, True, COLOR_MODE[ctrl.mode]), (16, y))
-        # range bar
-        bar_x, bar_w = 16, 560
-        frac = min(1.0, max(0.0, (value - c.minimum) / (c.maximum - c.minimum)))
-        pygame.draw.rect(screen, (60, 64, 72), (bar_x, y + 26, bar_w, 6))
-        pygame.draw.rect(screen, COLOR_BAR[ctrl.mode], (bar_x + int(frac * bar_w) - 3, y + 22, 6, 14))
-        y += 48
+        # range bar (a slider: click or drag it with the mouse)
+        pygame.draw.rect(screen, (60, 64, 72), (BAR_X, y + BAR_Y, BAR_W, 6))
+        goal = ctrl.slider_goal.get(c)
+        if goal is not None:
+            # Where the slider is taking this control.
+            pygame.draw.rect(screen, COLOR_GOAL, (slider_x(c, goal) - 5, y + BAR_Y - 6, 10, 18), 2)
+        pygame.draw.rect(screen, COLOR_BAR[ctrl.mode], (slider_x(c, value) - 3, y + BAR_Y - 4, 6, 14))
+        y += ROW_H
     help_lines = [
-        "Tap a key for a small step; hold it to move faster and faster.",
+        "Tap a key for a small step; hold it to move faster and faster."
+        if ctrl.mode == "joint" else "Hold a key to move; release it to stop.",
+        "Or click / drag a slider with the mouse.",
         "0 = home (T:100)   P = re-sync   L = LED   Esc = quit",
         "M = record on/off   B = play a recording",
     ]
@@ -927,7 +1235,7 @@ def main():
         ctrl.sync_from_arm()
 
     pygame.init()
-    screen = pygame.display.set_mode((600, 520))
+    screen = pygame.display.set_mode((600, 545))
     pygame.display.set_caption("RoArm-M3 Keyboard Controller")
     font = pygame.font.SysFont("monospace", 18)
     small = pygame.font.SysFont("monospace", 15)
@@ -947,6 +1255,14 @@ def main():
                     running = ctrl.handle_key(event.key, getattr(event, "unicode", ""), now)
                 elif event.type == pygame.KEYUP:
                     ctrl.key_up(event.key, now)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    hit = slider_at(ctrl.controls, event.pos)
+                    if hit is not None:
+                        ctrl.slider_press(*hit, now)
+                elif event.type == pygame.MOUSEMOTION and ctrl.dragging is not None:
+                    ctrl.slider_drag(slider_value(ctrl.dragging, event.pos[0]), now)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    ctrl.slider_release(now)
                 elif event.type == pygame.WINDOWFOCUSLOST:
                     # Key-up events are missed when focus is lost; stop everything.
                     ctrl.release_all_keys(now)
@@ -956,6 +1272,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # T:123 keeps an axis moving until it is told to stop.
+        ctrl.stop_all_axes(time.monotonic())
         pygame.quit()
         link.close()
 
