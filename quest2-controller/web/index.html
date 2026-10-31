@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoArm-M3 Quest 2 Controller</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #181a1e; color: #e6e6e6; margin: 0; padding: 24px; }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.5em; margin: 0 0 16px; }
+  h2 { font-size: 1.15em; margin: 0 0 4px; }
+  input[type=number] { font-size: 1.1em; width: 7em; padding: 4px; }
+  #rec-status { margin: 8px 0; min-height: 1.4em; }
+  #rec-list label { display: block; padding: 6px 0; color: #e6e6e6; }
+  #rec-list .bad { margin-left: 8px; }
+  button.recording { background: #d04545; }
+  .buttons { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+  button { font-size: 1.2em; padding: 14px 24px; border-radius: 10px; border: 0; cursor: pointer;
+           background: #3a8dde; color: white; }
+  button.secondary { background: #4a4f58; }
+  button:disabled { background: #333; color: #777; cursor: default; }
+  .panel { background: #23262c; border-radius: 10px; padding: 14px 18px; margin: 12px 0; }
+  .row { display: flex; justify-content: space-between; padding: 3px 0; }
+  .label { color: #9aa0a8; }
+  .ok { color: #7bd88f; } .warn { color: #f0c870; } .bad { color: #ff7a7a; }
+  #message { min-height: 1.4em; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 4px 8px 4px 0; vertical-align: top; }
+  td:first-child { color: #f0c870; white-space: nowrap; }
+  code { font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>RoArm-M3 Quest 2 Controller</h1>
+
+  <div class="buttons">
+    <button id="start-ar" disabled>Start (passthrough)</button>
+    <button id="start-vr" class="secondary" disabled>Start (VR)</button>
+  </div>
+  <div id="xr-support" class="warn"></div>
+
+  <div class="panel">
+    <div class="row"><span class="label">Server</span><span id="conn" class="bad">connecting...</span></div>
+    <div class="row"><span class="label">Arm link</span><span id="link">-</span></div>
+    <div class="row"><span class="label">State</span><span id="state">-</span></div>
+    <div class="row"><span class="label">Pitch / roll</span><span id="orientation">-</span></div>
+    <div class="row"><span class="label">Target</span><code id="target">-</code></div>
+    <div id="message" class="warn"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Recordings</h2>
+    <div class="buttons">
+      <button id="record" class="secondary">Start recording</button>
+      <button id="play" class="secondary">Play</button>
+      <button id="stop" class="secondary">Stop</button>
+      <button id="refresh" class="secondary">Refresh list</button>
+    </div>
+    <label>Loops <input id="loops" type="number" min="0" max="999999" value="1"> <span class="label">(1 = once, 0 = forever)</span></label>
+    <div id="rec-status"></div>
+    <div id="rec-list" class="label">No recordings yet.</div>
+  </div>
+
+  <div class="panel">
+    <table>
+      <tr><td><span class="hand-cap">Right</span> grip (hold)</td><td>The arm follows the controller. Release to freeze it, move your hand, squeeze again to carry on.</td></tr>
+      <tr><td><span class="hand-cap">Right</span> trigger</td><td id="trigger-help">Closes the gripper.</td></tr>
+      <tr><td><span id="key-home">A</span></td><td>Send the arm to its home position (<code>T:100</code>).</td></tr>
+      <tr><td><span id="key-orientation">B</span></td><td>Turn pitch/roll following on or off.</td></tr>
+      <tr><td><span id="key-record">X</span></td><td>Start recording / stop recording and save it.</td></tr>
+      <tr><td><span id="key-play">Y</span></td><td>Play the selected recording / stop playing. Squeezing the <span class="hand-low">right</span> grip also stops it.</td></tr>
+      <tr><td>Exit</td><td>Press the Meta (Oculus) button and quit the immersive view.</td></tr>
+    </table>
+  </div>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
